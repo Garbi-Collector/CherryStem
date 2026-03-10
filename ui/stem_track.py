@@ -67,16 +67,27 @@ class StemTrack(tk.Frame):
     # ── Public API ─────────────────────────────────────────────────────────
     def set_file(self, path):
         self.filepath = path
-        self.status_lbl.config(text="✓", fg=SUCCESS)
+        self.status_lbl.config(text="✓ cargando…", fg=SUCCESS)
+        # Precarga en hilo para no bloquear la UI
+        import threading
+        threading.Thread(target=self._preload, daemon=True).start()
         self.waveform.set_waveform()
 
-    def play(self):
-        if not self.filepath or not os.path.exists(self.filepath):
-            return
+    def _preload(self):
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
             self._sound = pygame.mixer.Sound(self.filepath)
+            # Actualizar label en el hilo de tkinter
+            self.after(0, lambda: self.status_lbl.config(text="✓", fg=SUCCESS))
+        except Exception as e:
+            print(f"[{self.stem_name}] preload error: {e}")
+            self.after(0, lambda: self.status_lbl.config(text="⚠", fg="#f59e0b"))
+
+    def play(self):
+        if not self._sound:
+            return
+        try:
             self._channel = self._sound.play()
             if self._muted and self._channel:
                 self._channel.set_volume(0)
@@ -104,12 +115,14 @@ class StemTrack(tk.Frame):
             self._channel.set_volume(0 if muted else 1)
 
     def reset(self):
+        self.stop()
         self.filepath = None
+        self._sound   = None
+        self._channel = None
         self._muted = self._soloed = self._playing = False
         self.btn_mute.config(fg=TEXT3)
         self.btn_solo.config(fg=TEXT3)
         self.status_lbl.config(text="", fg=TEXT3)
-        self.waveform.stop_animation()
         self.waveform.delete("all")
 
     # ── Internal actions ───────────────────────────────────────────────────
