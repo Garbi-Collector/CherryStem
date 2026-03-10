@@ -272,12 +272,18 @@ class CherryStemApp:
         self._stop_ticker()
 
     def _on_seek(self, v):
-        if self._duration_ms > 0:
-            self._pos_ms = v * self._duration_ms
-            for t in self._tracks.values():
-                t.set_waveform_progress(v)
-            if self.is_playing:
-                self._play_start = time.time() * 1000 - self._pos_ms
+        if self._duration_ms <= 0:
+            return
+        self._pos_ms = v * self._duration_ms
+        for t in self._tracks.values():
+            t.set_waveform_progress(v)
+        if self.is_playing:
+            # Recalcular play_start para que el ticker no se desincronice
+            self._play_start = time.time() * 1000 - self._pos_ms
+            # Reiniciar cada stem desde el offset
+            for name, track in self._tracks.items():
+                if name in self.stems:
+                    track.play_from(self._pos_ms)
 
     def _start_ticker(self):
         self._stop_ticker()

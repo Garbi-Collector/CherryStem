@@ -15,6 +15,7 @@ class StemTrack(tk.Frame):
                          highlightthickness=1, highlightbackground=BORDER,
                          **kwargs)
         self.stem_name = stem_name
+        self._current_sound = None
         self.color = color
         self.on_solo = on_solo
         self.filepath = None
@@ -85,23 +86,48 @@ class StemTrack(tk.Frame):
             self.after(0, lambda: self.status_lbl.config(text="⚠", fg="#f59e0b"))
 
     def play(self):
+        self.play_from(0)
+
+    def play_from(self, ms):
+        """Reproduce el stem desde el offset indicado en milisegundos."""
         if not self._sound:
             return
         try:
-            self._channel = self._sound.play()
+            # Detener reproducción anterior
+            self._sound.stop()
+
+            import numpy as np
+            # Obtener samples del Sound como array numpy
+            samples = pygame.sndarray.array(self._sound)
+            freq, _, _ = pygame.mixer.get_init()  # (freq, size, channels)
+
+            # Calcular sample de inicio
+            start_sample = int((ms / 1000.0) * freq)
+            start_sample = max(0, min(start_sample, len(samples) - 1))
+
+            sliced = samples[start_sample:]
+            if len(sliced) == 0:
+                return
+
+            new_sound = pygame.sndarray.make_sound(sliced)
+            self._channel = new_sound.play()
+            # Guardamos referencia para poder silenciar/detener
+            self._current_sound = new_sound
+
             if self._muted and self._channel:
                 self._channel.set_volume(0)
             self._playing = True
             self.waveform.start_animation()
         except Exception as e:
-            print(f"[{self.stem_name}] play error: {e}")
+            print(f"[{self.stem_name}] play_from error: {e}")
 
     def stop(self):
-        if self._sound:
-            try:
-                self._sound.stop()
-            except Exception:
-                pass
+        for s in [self._sound, getattr(self, '_current_sound', None)]:
+            if s:
+                try:
+                    s.stop()
+                except Exception:
+                    pass
         self._playing = False
         self.waveform.stop_animation()
 
