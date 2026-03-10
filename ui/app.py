@@ -1,11 +1,12 @@
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import os
 import time
 import zipfile
 import pygame
-
 from separator import separar_audio
+from youtube_downloader import es_url_youtube, descargar_audio_youtube
 from .theme import (ACCENT, ACCENT_D, BG, BG3, BORDER, BORDER2, CARD,
                     FONT_LABEL, FONT_MONO, FONT_SMALL, SUCCESS, TEXT, TEXT2,
                     TEXT3, STEM_COLORS, STEM_ICONS, STEM_LABELS)
@@ -20,22 +21,22 @@ class CherryStemApp:
             pygame.mixer.init()
         except Exception:
             pass
-
         self.root = tk.Tk()
         self.root.title("CherryStem")
         self.root.configure(bg=BG)
         self.root.minsize(720, 680)
         self.root.geometry("820x820")
-
-        self.input_file     = None
-        self.stems          = {}
-        self.is_playing     = False
-        self._tracks        = {}
-        self._duration_ms   = 0
-        self._pos_ms        = 0
-        self._play_start    = 0
-        self._ticker_id     = None
-
+        self.input_file      = None
+        self.stems           = {}
+        self.is_playing      = False
+        self._tracks         = {}
+        self._duration_ms    = 0
+        self._pos_ms         = 0
+        self._play_start     = 0
+        self._ticker_id      = None
+        self._sep_process    = None   # referencia al subprocess de demucs
+        self._yt_tmp_dir     = None   # carpeta temporal de descarga de YouTube
+        self._separating     = False  # flag para saber si hay proceso activo
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -43,15 +44,12 @@ class CherryStemApp:
     def _build_ui(self):
         self._build_header()
         tk.Frame(self.root, bg=BORDER, height=1).pack(fill=tk.X)
-
         body = tk.Frame(self.root, bg=BG)
         body.pack(fill=tk.BOTH, expand=True, padx=22, pady=14)
-
         self._build_file_card(body)
         self._build_sep_row(body)
         self._build_log_card(body)
         self._build_tracks(body)
-
         tk.Frame(self.root, bg=BORDER, height=1).pack(fill=tk.X, side=tk.BOTTOM)
         self.player = BottomPlayer(
             self.root,
@@ -78,17 +76,31 @@ class CherryStemApp:
         inner = tk.Frame(card, bg=CARD)
         inner.pack(fill=tk.X, padx=16, pady=12)
 
-        tk.Label(inner, text="AUDIO FILE", font=FONT_LABEL, bg=CARD, fg=TEXT3).pack(anchor="w")
+        # Encabezado con label y hint de YouTube
+        header_row = tk.Frame(inner, bg=CARD)
+        header_row.pack(fill=tk.X)
+        tk.Label(header_row, text="AUDIO FILE OR YOUTUBE URL",
+                 font=FONT_LABEL, bg=CARD, fg=TEXT3).pack(side=tk.LEFT, anchor="w")
+        tk.Label(header_row, text="▶ youtube.com/watch?v=...  ·  youtu.be/...",
+                 font=FONT_SMALL, bg=CARD, fg=TEXT3).pack(side=tk.RIGHT, anchor="e")
+
         row = tk.Frame(inner, bg=CARD)
         row.pack(fill=tk.X, pady=(5, 0))
 
+        # Entry ahora es editable para pegar URLs
         self.entry_path = tk.Entry(
             row, font=("Segoe UI", 9), bg=BG3, fg=TEXT,
             insertbackground=TEXT, relief=tk.FLAT,
             highlightthickness=1, highlightbackground=BORDER,
-            highlightcolor=ACCENT, readonlybackground=BG3, state="readonly",
+            highlightcolor=ACCENT,
         )
         self.entry_path.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=7, padx=(0, 8))
+        # Placeholder
+        self._entry_placeholder = "Paste a YouTube URL or browse a file…"
+        self._set_placeholder()
+        self.entry_path.bind("<FocusIn>",  self._on_entry_focus_in)
+        self.entry_path.bind("<FocusOut>", self._on_entry_focus_out)
+        self.entry_path.bind("<Return>",   lambda e: self._load_from_entry())
 
         b = tk.Label(row, text="Browse", font=("Segoe UI", 9, "bold"),
                      bg=BG3, fg=TEXT2, cursor="hand2", padx=14, pady=7,
@@ -98,8 +110,40 @@ class CherryStemApp:
         b.bind("<Leave>",    lambda e: b.config(bg=BG3,     fg=TEXT2))
         b.pack(side=tk.LEFT)
 
-        tk.Label(inner, text="MP3 · WAV · FLAC · M4A · OGG",
+        tk.Label(inner, text="MP3 · WAV · FLAC · M4A · OGG  ·  or paste a YouTube link and press Enter",
                  font=FONT_SMALL, bg=CARD, fg=TEXT3).pack(anchor="w", pady=(4, 0))
+
+    def _set_placeholder(self):
+        self.entry_path.delete(0, tk.END)
+        self.entry_path.insert(0, self._entry_placeholder)
+        self.entry_path.config(fg=TEXT3)
+        self._placeholder_active = True
+
+    def _on_entry_focus_in(self, event):
+        if getattr(self, "_placeholder_active", False):
+            self.entry_path.delete(0, tk.END)
+            self.entry_path.config(fg=TEXT)
+            self._placeholder_active = False
+
+    def _on_entry_focus_out(self, event):
+        if not self.entry_path.get().strip():
+            self._set_placeholder()
+
+    def _load_from_entry(self):
+        """Llamado al presionar Enter en el campo: carga la URL si es YouTube."""
+        val = self.entry_path.get().strip()
+        if not val or val == self._entry_placeholder:
+            return
+        if es_url_youtube(val):
+            self._log(f"🔗 YouTube URL detectada: {val}")
+            self.input_file = val          # guardamos la URL como "archivo"
+            self.player.set_track_name(val)
+            for t in self._tracks.values():
+                t.reset()
+            self.stems = {}
+            self.player.reset()
+        else:
+            self._log("⚠️  No es una URL de YouTube válida. Usá Browse para archivos locales.")
 
     def _build_sep_row(self, parent):
         row = tk.Frame(parent, bg=BG)
@@ -111,9 +155,22 @@ class CherryStemApp:
             bg=ACCENT, fg=TEXT, cursor="hand2", padx=20, pady=11, relief=tk.FLAT,
         )
         self.btn_sep.bind("<Button-1>", lambda e: self._start_separation())
-        self.btn_sep.bind("<Enter>",    lambda e: self.btn_sep.config(bg=ACCENT_D))
-        self.btn_sep.bind("<Leave>",    lambda e: self.btn_sep.config(bg=ACCENT))
+        self.btn_sep.bind("<Enter>",    lambda e: self.btn_sep.config(bg=ACCENT_D) if not self._separating else None)
+        self.btn_sep.bind("<Leave>",    lambda e: self.btn_sep.config(bg=ACCENT)   if not self._separating else None)
         self.btn_sep.pack(side=tk.LEFT)
+
+        # Botón cancelar — solo visible durante la separación
+        self.btn_cancel = tk.Label(
+            row, text="  ✕  CANCEL  ",
+            font=("Segoe UI", 11, "bold"),
+            bg=BG3, fg=TEXT2, cursor="hand2", padx=16, pady=11, relief=tk.FLAT,
+            highlightthickness=1, highlightbackground=BORDER,
+        )
+        self.btn_cancel.bind("<Button-1>", lambda e: self._cancel_separation())
+        self.btn_cancel.bind("<Enter>",    lambda e: self.btn_cancel.config(bg=BORDER2, fg=TEXT))
+        self.btn_cancel.bind("<Leave>",    lambda e: self.btn_cancel.config(bg=BG3,     fg=TEXT2))
+        # Empieza oculto
+        self.btn_cancel.pack_forget()
 
         self.progress_var = tk.DoubleVar()
         self.progressbar  = ttk.Progressbar(parent, variable=self.progress_var,
@@ -163,10 +220,10 @@ class CherryStemApp:
         if not path:
             return
         self.input_file = path
-        self.entry_path.config(state="normal")
+        self.entry_path.config(fg=TEXT)
+        self._placeholder_active = False
         self.entry_path.delete(0, tk.END)
         self.entry_path.insert(0, path)
-        self.entry_path.config(state="readonly")
         self._log(f"Loaded: {os.path.basename(path)}")
         for t in self._tracks.values():
             t.reset()
@@ -175,28 +232,126 @@ class CherryStemApp:
         self.player.reset()
 
     # ── Separation ─────────────────────────────────────────────────────────
-    def _start_separation(self):
-        if not self.input_file or not os.path.exists(self.input_file):
-            messagebox.showwarning("No file", "Please select an audio file first.")
+    def _set_separating(self, active: bool):
+        """Actualiza el estado visual de los botones según si hay proceso activo."""
+        self._separating = active
+        if active:
+            self.btn_sep.config(fg=TEXT3, cursor="")
+            self.btn_cancel.pack(side=tk.LEFT, padx=(8, 0))
+            self.progressbar.pack(fill=tk.X, pady=(0, 8))
+            self.progressbar.start(15)
+        else:
+            self.btn_sep.config(fg=TEXT, cursor="hand2")
+            self.btn_cancel.pack_forget()
+            self.progressbar.stop()
+            self.progressbar.pack_forget()
+
+    def _cancel_separation(self):
+        """Cancela el proceso activo (descarga o separación)."""
+        if not self._separating:
             return
+        self._log("⏹ Cancelando proceso...")
+        # Matar subprocess de demucs si está corriendo
+        if self._sep_process and self._sep_process.poll() is None:
+            try:
+                self._sep_process.terminate()
+            except Exception:
+                pass
+        # Limpiar tmp dir de YouTube si existe
+        self._cleanup_yt_tmp()
+        self._set_separating(False)
+        self._log("✕ Proceso cancelado.")
+
+    def _cleanup_yt_tmp(self):
+        if self._yt_tmp_dir and os.path.exists(self._yt_tmp_dir):
+            import shutil
+            try:
+                shutil.rmtree(self._yt_tmp_dir)
+            except Exception:
+                pass
+        self._yt_tmp_dir = None
+
+    def _start_separation(self):
+        if self._separating:
+            return  # ya hay un proceso en curso
+
+        val = self.entry_path.get().strip()
+        is_placeholder = getattr(self, "_placeholder_active", False) or val == self._entry_placeholder
+
+        # Decidir fuente: URL de YouTube o archivo local
+        if not is_placeholder and es_url_youtube(val):
+            self.input_file = val
+
+        if not self.input_file:
+            messagebox.showwarning("No source", "Please select a file or paste a YouTube URL first.")
+            return
+
         self._stop_all()
         self._clear_log()
-        self._log("Starting separation (htdemucs)…")
-        self._log("First run may take several minutes.")
-        self.btn_sep.config(fg=TEXT3)
-        self.progressbar.pack(fill=tk.X, pady=(0, 8))
-        self.progressbar.start(15)
-        out_dir = os.path.join(os.path.dirname(self.input_file), "cherrystem_output")
-        separar_audio(
-            self.input_file, out_dir, model="htdemucs",
-            progress_callback=lambda msg: self.root.after(0, self._log, msg),
-            done_callback=lambda s, e: self.root.after(0, self._on_done, s, e),
+        self._set_separating(True)
+
+        # ── Flujo YouTube ──────────────────────────────────────────────────
+        if es_url_youtube(str(self.input_file)):
+            self._log(f"🔗 YouTube URL detectada. Descargando audio…")
+
+            def on_descarga(ruta_mp3, error):
+                if not self._separating:   # fue cancelado
+                    return
+                if error:
+                    self.root.after(0, self._on_done, None, f"Error en descarga: {error}")
+                    return
+                self._yt_tmp_dir = os.path.dirname(ruta_mp3)
+                self.root.after(0, self._log, "🎵 Descarga completa. Iniciando separación…")
+                self._run_separation(ruta_mp3)
+
+            descargar_audio_youtube(
+                url=self.input_file,
+                progress_callback=lambda msg: self.root.after(0, self._log, msg),
+                done_callback=on_descarga,
+            )
+
+        # ── Flujo archivo local ────────────────────────────────────────────
+        else:
+            if not os.path.exists(self.input_file):
+                self._on_done(None, "El archivo no existe.")
+                return
+            self._log("Starting separation (htdemucs)…")
+            self._log("First run may take several minutes.")
+            self._run_separation(self.input_file)
+
+    def _run_separation(self, audio_file):
+        """Lanza separar_audio pasando la referencia al proceso para poder cancelarlo."""
+        out_dir = os.path.join(
+            os.path.dirname(audio_file) if os.path.isabs(audio_file) else os.getcwd(),
+            "cherrystem_output"
         )
 
+        # Monkey-patch temporal: interceptamos el proceso para guardarlo
+        _original_popen = subprocess.Popen
+
+        app_ref = self
+
+        class _TrackingPopen(_original_popen):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                app_ref._sep_process = self
+
+        subprocess.Popen = _TrackingPopen
+
+        try:
+            separar_audio(
+                audio_file, out_dir, model="htdemucs",
+                progress_callback=lambda msg: self.root.after(0, self._log, msg),
+                done_callback=lambda s, e: self.root.after(0, self._on_done, s, e),
+            )
+        finally:
+            subprocess.Popen = _original_popen
+
     def _on_done(self, stems, error):
-        self.progressbar.stop()
-        self.progressbar.pack_forget()
-        self.btn_sep.config(fg=TEXT)
+        self._set_separating(False)
+        self._cleanup_yt_tmp()
+        self._sep_process = None
+
         if error:
             self._log(f"❌ {error}")
             messagebox.showerror("Error", f"Separation failed:\n\n{error}\n\npip install demucs")
@@ -204,6 +359,7 @@ class CherryStemApp:
         if not stems:
             self._log("❌ No output tracks found.")
             return
+
         self.stems = stems
         self._log("✅ Separation complete.")
         for name, path in stems.items():
@@ -278,9 +434,7 @@ class CherryStemApp:
         for t in self._tracks.values():
             t.set_waveform_progress(v)
         if self.is_playing:
-            # Recalcular play_start para que el ticker no se desincronice
             self._play_start = time.time() * 1000 - self._pos_ms
-            # Reiniciar cada stem desde el offset
             for name, track in self._tracks.items():
                 if name in self.stems:
                     track.play_from(self._pos_ms)
@@ -339,6 +493,7 @@ class CherryStemApp:
 
     # ── Close ──────────────────────────────────────────────────────────────
     def _on_close(self):
+        self._cancel_separation()
         self._stop_all()
         try:
             pygame.mixer.quit()

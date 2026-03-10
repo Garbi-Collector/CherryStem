@@ -2,10 +2,40 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import os
 import shutil
+import threading
 import pygame
 from .widgets import WaveformCanvas
 from .theme import (ACCENT, BG3, BORDER, BORDER2, CARD, FONT_SMALL,
                     SUCCESS, TEXT, TEXT3)
+
+
+def _load_sound_safe(filepath):
+    """
+    Carga un archivo de audio como pygame.mixer.Sound.
+    - WAV/OGG: carga directo.
+    - MP3: convierte a WAV en memoria usando pydub (requiere ffmpeg).
+    Lanza excepción si falla.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext in (".wav", ".ogg", ".flac"):
+        return pygame.mixer.Sound(filepath)
+
+    if ext == ".mp3":
+        try:
+            from pydub import AudioSegment
+            import io
+            audio = AudioSegment.from_mp3(filepath)
+            wav_io = io.BytesIO()
+            audio.export(wav_io, format="wav")
+            wav_io.seek(0)
+            return pygame.mixer.Sound(wav_io)
+        except ImportError:
+            # pydub no instalado — intentar directo igual (puede funcionar en algunas builds de pygame)
+            return pygame.mixer.Sound(filepath)
+
+    # Cualquier otro formato: intento directo
+    return pygame.mixer.Sound(filepath)
 
 
 class StemTrack(tk.Frame):
@@ -29,13 +59,10 @@ class StemTrack(tk.Frame):
     # ── Build ──────────────────────────────────────────────────────────────
     def _build(self, icon, label):
         tk.Frame(self, bg=self.color, width=3).pack(side=tk.LEFT, fill=tk.Y)
-
         body = tk.Frame(self, bg=CARD)
         body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 8), pady=8)
-
         top = tk.Frame(body, bg=CARD)
         top.pack(fill=tk.X)
-
         tk.Label(top, text=icon, font=("Segoe UI Emoji", 14),
                  bg=CARD, fg=self.color).pack(side=tk.LEFT, padx=(0, 6))
         tk.Label(top, text=label, font=("Segoe UI", 9, "bold"),
@@ -43,7 +70,6 @@ class StemTrack(tk.Frame):
         self.status_lbl = tk.Label(top, text="", font=FONT_SMALL,
                                    bg=CARD, fg=TEXT3)
         self.status_lbl.pack(side=tk.LEFT, padx=6)
-
         btn_f = tk.Frame(top, bg=CARD)
         btn_f.pack(side=tk.RIGHT)
         self.btn_mute = self._chip(btn_f, "M", self._toggle_mute)
@@ -51,7 +77,6 @@ class StemTrack(tk.Frame):
         self.btn_solo = self._chip(btn_f, "S", self._toggle_solo)
         self.btn_solo.pack(side=tk.LEFT, padx=2)
         self._chip(btn_f, "↓", self._download).pack(side=tk.LEFT, padx=(2, 0))
-
         self.waveform = WaveformCanvas(body, self.color, height=40)
         self.waveform.pack(fill=tk.X, pady=(5, 0))
 
@@ -69,8 +94,6 @@ class StemTrack(tk.Frame):
     def set_file(self, path):
         self.filepath = path
         self.status_lbl.config(text="✓ cargando…", fg=SUCCESS)
-        # Precarga en hilo para no bloquear la UI
-        import threading
         threading.Thread(target=self._preload, daemon=True).start()
         self.waveform.set_waveform()
 
@@ -78,12 +101,14 @@ class StemTrack(tk.Frame):
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
-            self._sound = pygame.mixer.Sound(self.filepath)
-            # Actualizar label en el hilo de tkinter
+            self._sound = _load_sound_safe(self.filepath)
             self.after(0, lambda: self.status_lbl.config(text="✓", fg=SUCCESS))
         except Exception as e:
             print(f"[{self.stem_name}] preload error: {e}")
-            self.after(0, lambda: self.status_lbl.config(text="⚠", fg="#f59e0b"))
+            self.after(0, lambda: self.status_lbl.config(
+                text="⚠ MP3 no soportado — instalá pydub+ffmpeg",
+                fg="#f59e0b"
+            ))
 
     def play(self):
         self.play_from(0)
@@ -93,27 +118,18 @@ class StemTrack(tk.Frame):
         if not self._sound:
             return
         try:
-            # Detener reproducción anterior
             self._sound.stop()
-
             import numpy as np
-            # Obtener samples del Sound como array numpy
             samples = pygame.sndarray.array(self._sound)
-            freq, _, _ = pygame.mixer.get_init()  # (freq, size, channels)
-
-            # Calcular sample de inicio
+            freq, _, _ = pygame.mixer.get_init()
             start_sample = int((ms / 1000.0) * freq)
             start_sample = max(0, min(start_sample, len(samples) - 1))
-
             sliced = samples[start_sample:]
             if len(sliced) == 0:
                 return
-
             new_sound = pygame.sndarray.make_sound(sliced)
             self._channel = new_sound.play()
-            # Guardamos referencia para poder silenciar/detener
             self._current_sound = new_sound
-
             if self._muted and self._channel:
                 self._channel.set_volume(0)
             self._playing = True
@@ -168,10 +184,11 @@ class StemTrack(tk.Frame):
         if not self.filepath or not os.path.exists(self.filepath):
             messagebox.showwarning("No file", "Separate audio first.")
             return
+        ext = os.path.splitext(self.filepath)[1]
         dest = filedialog.asksaveasfilename(
-            defaultextension=".wav",
-            filetypes=[("WAV", "*.wav"), ("All", "*.*")],
-            initialfile=f"{self.stem_name}.wav",
+            defaultextension=ext,
+            filetypes=[("WAV", "*.wav"), ("MP3", "*.mp3"), ("All", "*.*")],
+            initialfile=f"{self.stem_name}{ext}",
         )
         if dest:
             shutil.copy2(self.filepath, dest)

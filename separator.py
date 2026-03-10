@@ -35,12 +35,11 @@ def separar_audio(input_file, output_folder, model="htdemucs", progress_callback
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
 
-            # --mp3 evita usar torchaudio/torchcodec para guardar
+            # Sin --mp3: demucs genera WAV por defecto, compatible con pygame.mixer.Sound
             comando = [
                 "python", "-m", "demucs.separate",
                 "-n", model,
                 "-o", output_folder,
-                "--mp3",
                 tmp_file
             ]
 
@@ -87,7 +86,8 @@ def separar_audio(input_file, output_folder, model="htdemucs", progress_callback
 
             stems = {}
             for stem_key in ["vocals", "drums", "bass", "other"]:
-                for ext_out in [".mp3", ".wav", ".flac"]:
+                # WAV primero (output default de demucs), luego fallbacks
+                for ext_out in [".wav", ".mp3", ".flac"]:
                     path = os.path.join(stems_folder, stem_key + ext_out)
                     if os.path.exists(path):
                         stems[stem_key] = path
